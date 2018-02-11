@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"log"
 	"fmt"
 	"math/big"
 	"strconv"
@@ -166,7 +167,7 @@ func (r *RedisClient) checkPoWExist(height uint64, params []string) (bool, error
 	return val == 0, err
 }
 
-func (r *RedisClient) WriteShare(login, id string, params []string, diff int64, height uint64, window time.Duration) (bool, error) {
+func (r *RedisClient) WriteShare(login, id string, params []string, diff int64, height uint64, window time.Duration, hashLimit int64) (bool, error) {
 	exist, err := r.checkPoWExist(height, params)
 	if err != nil {
 		return false, err
@@ -181,11 +182,16 @@ func (r *RedisClient) WriteShare(login, id string, params []string, diff int64, 
 	ms := util.MakeTimestamp()
 	ts := ms / 1000
 
-	_, err = tx.Exec(func() error {
-		r.writeShare(tx, ms, ts, login, id, diff, window)
-		tx.HIncrBy(r.formatKey("stats"), "roundShares", diff)
-		return nil
-	})
+	mineraccept, err := r.AccountHash(login, hashLimit)
+
+	if mineraccept {
+		_, err = tx.Exec(func() error {
+			r.writeShare(tx, ms, ts, login, id, diff, window)
+			tx.HIncrBy(r.formatKey("stats"), "roundShares", diff)
+			return nil
+		})
+	}
+
 	return false, err
 }
 
@@ -647,7 +653,7 @@ func (r *RedisClient) FlushStaleStats(window, largeWindow time.Duration) (int64,
 	return total, nil
 }
 
-func (r *RedisClient) CollectStats(smallWindow time.Duration, maxBlocks, maxPayments int64) (map[string]interface{}, error) {
+func (r *RedisClient) CollectStats(smallWindow time.Duration, maxBlocks, maxPayments int64, hashLimit int64) (map[string]interface{}, error) {
 	window := int64(smallWindow / time.Second)
 	stats := make(map[string]interface{})
 
@@ -693,7 +699,7 @@ func (r *RedisClient) CollectStats(smallWindow time.Duration, maxBlocks, maxPaym
 	stats["payments"] = payments
 	stats["paymentsTotal"] = cmds[9].(*redis.IntCmd).Val()
 
-	totalHashrate, miners := convertMinersStats(window, cmds[1].(*redis.ZSliceCmd))
+	totalHashrate, miners := convertMinersStats(window, cmds[1].(*redis.ZSliceCmd), hashLimit)
 	stats["miners"] = miners
 	stats["minersTotal"] = len(miners)
 	stats["hashrate"] = totalHashrate
@@ -896,7 +902,7 @@ func convertWorkersStats(window int64, raw *redis.ZSliceCmd) map[string]Worker {
 	return workers
 }
 
-func convertMinersStats(window int64, raw *redis.ZSliceCmd) (int64, map[string]Miner) {
+func convertMinersStats(window int64, raw *redis.ZSliceCmd, hashLimit int64) (int64, map[string]Miner) {
 	now := util.MakeTimestamp() / 1000
 	miners := make(map[string]Miner)
 	totalHashrate := int64(0)
@@ -933,6 +939,10 @@ func convertMinersStats(window int64, raw *redis.ZSliceCmd) (int64, map[string]M
 		if miner.LastBeat < (now - window/2) {
 			miner.Offline = true
 		}
+
+//		if hashLimit > 0 && miner.HR > hashLimit{
+//			miner.HR = hashLimit
+//		}
 		totalHashrate += miner.HR
 		miners[id] = miner
 	}
@@ -956,4 +966,37 @@ func convertPaymentsResults(raw *redis.ZSliceCmd) []map[string]interface{} {
 		result = append(result, tx)
 	}
 	return result
+}
+
+func (r *RedisClient) AccountHash(login string, hashLimit int64) (bool, error) {
+	exist, err := r.IsMinerExists(login)
+	if !exist {
+		log.Printf("TEST1 : %v", err)
+		return true, nil
+	}
+	if err != nil {
+		log.Printf("TEST2 : %v", err)
+		return true, nil
+	}
+
+	hashrateWindow := util.MustParseDuration("30m")
+	hashrateLargeWindow := util.MustParseDuration("3h")
+
+	workers, err := r.CollectWorkersStats(hashrateWindow, hashrateLargeWindow, login)
+	if err != nil {
+		log.Printf("workers : %s", workers)
+		return true, nil
+	}
+
+//	log.Printf("hashLimit : %d", hashLimit)
+//	log.Printf("currentHashrate: %d", workers["currentHashrate"])
+//	log.Printf("workers online : %s", workers["workersOnline"])
+	var currentHashrate int64
+	currentHashrate = workers["currentHashrate"].(int64)
+
+	if currentHashrate > hashLimit {
+		return false, nil
+	}
+
+	return true, nil
 }
